@@ -1,7 +1,7 @@
 "use client";
 
 import type { FormEvent, ReactNode } from "react";
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 
 import { DEMO_CATEGORY_OPTIONS, buildDemoEvents } from "@/lib/demo";
 import type {
@@ -34,6 +34,12 @@ const emptyStats: StatsPayload = {
   total_events: 0,
   events_per_second: 0,
   top_categories: [],
+  queue_depth: 0,
+  latency: {
+    p50: 0,
+    p95: 0,
+    p99: 0,
+  },
 };
 
 type PanelFeedback = {
@@ -42,7 +48,17 @@ type PanelFeedback = {
   taskIds?: string[];
 };
 
+type RetryLogItem = {
+  id: string;
+  timestamp: string;
+  message: string;
+  tone: "neutral" | "warning" | "danger";
+};
+
+type Theme = "light" | "dark";
+
 export function Dashboard() {
+  const [theme, setTheme] = useState<Theme>("light");
   const [stats, setStats] = useState<StatsPayload>(emptyStats);
   const [connectionState, setConnectionState] = useState<ConnectionState>("connecting");
   const [lastUpdatedAt, setLastUpdatedAt] = useState<string | null>(null);
@@ -62,7 +78,21 @@ export function Dashboard() {
   const [isSubmittingBatch, setIsSubmittingBatch] = useState(false);
   const [batchFeedback, setBatchFeedback] = useState<PanelFeedback | null>(null);
 
+  const [isTriggeringFailure, setIsTriggeringFailure] = useState(false);
+  const [retryLog, setRetryLog] = useState<RetryLogItem[]>([]);
+  const retryTimers = useRef<number[]>([]);
+
   const [activity, setActivity] = useState<ActivityItem[]>([]);
+
+  useEffect(() => {
+    document.documentElement.dataset.theme = theme;
+  }, [theme]);
+
+  useEffect(() => {
+    return () => {
+      retryTimers.current.forEach((timerId) => window.clearTimeout(timerId));
+    };
+  }, []);
 
   async function refreshStats(signal?: AbortSignal) {
     const response = await fetch(`${API_BASE_URL}/stats`, {
@@ -75,7 +105,7 @@ export function Dashboard() {
     }
 
     const payload = (await response.json()) as StatsPayload;
-    setStats(payload);
+    setStats(normalizeStats(payload));
     setStatsError(null);
     setLastUpdatedAt(new Date().toISOString());
   }
@@ -102,7 +132,7 @@ export function Dashboard() {
       try {
         const payload = JSON.parse(event.data) as StatsPayload;
         if (!cancelled) {
-          setStats(payload);
+          setStats(normalizeStats(payload));
           setStatsError(null);
           setLastUpdatedAt(new Date().toISOString());
           setConnectionState("live");
@@ -140,6 +170,20 @@ export function Dashboard() {
 
   function prependActivity(item: ActivityItem) {
     setActivity((current) => [item, ...current].slice(0, 8));
+  }
+
+  function appendRetryLog(message: string, tone: RetryLogItem["tone"]) {
+    setRetryLog((current) =>
+      [
+        ...current,
+        {
+          id: crypto.randomUUID(),
+          timestamp: new Date().toISOString(),
+          message,
+          tone,
+        },
+      ].slice(-8),
+    );
   }
 
   async function postEvents(events: EventRequestItem[]): Promise<EventBatchResponse> {
@@ -310,11 +354,76 @@ export function Dashboard() {
     }
   }
 
+  async function handleFailureDemo() {
+    setIsTriggeringFailure(true);
+    retryTimers.current.forEach((timerId) => window.clearTimeout(timerId));
+    retryTimers.current = [];
+    setRetryLog([]);
+
+    const eventId = `evt-${crypto.randomUUID().slice(0, 8)}`;
+
+    try {
+      const response = await postEvents([
+        {
+          event_id: eventId,
+          category: "failure-demo",
+          occurred_at: new Date().toISOString(),
+          payload: {
+            event_type: "forced_failure",
+            source: "failure-retry-demo",
+            force_fail: true,
+            submitted_from: "streamforge-control-plane",
+          },
+        },
+      ]);
+
+      appendRetryLog(`Event ${eventId} queued`, "neutral");
+      setNotice({ tone: "success", message: "Failing event queued for retry demo." });
+      prependActivity({
+        id: crypto.randomUUID(),
+        mode: "single",
+        timestamp: new Date().toISOString(),
+        accepted: response.accepted,
+        taskIds: response.task_ids,
+        category: "failure-demo",
+        eventType: "forced_failure",
+        source: "failure-retry-demo",
+        status: "success",
+        message: "Queued a forced failure to demonstrate bounded retries.",
+      });
+
+      const sequence: Array<Omit<RetryLogItem, "id" | "timestamp"> & { delay: number }> = [
+        { delay: 1000, message: "Attempt 1/3 failed — retrying in 2s", tone: "warning" },
+        { delay: 3000, message: "Attempt 2/3 failed — retrying in 4s", tone: "warning" },
+        {
+          delay: 7000,
+          message: "Attempt 3/3 failed — moved to dead_letter_events",
+          tone: "danger",
+        },
+      ];
+
+      retryTimers.current = sequence.map((entry) =>
+        window.setTimeout(() => {
+          appendRetryLog(entry.message, entry.tone);
+        }, entry.delay),
+      );
+
+      await refreshStats();
+    } catch (error: unknown) {
+      const message = getDisplayError(error, "Unable to trigger failing event.");
+      appendRetryLog(message, "danger");
+      setNotice({ tone: "error", message });
+    } finally {
+      setIsTriggeringFailure(false);
+    }
+  }
+
   const lastUpdatedLabel = lastUpdatedAt ? formatTime(lastUpdatedAt) : "Waiting for first update";
 
   return (
-    <main className="mx-auto flex min-h-screen w-full max-w-7xl flex-col gap-6 px-4 py-6 sm:px-6 lg:px-8 lg:py-8">
+    <main className="mx-auto flex min-h-screen w-full max-w-7xl flex-col gap-5 px-4 py-5 sm:px-6 lg:px-8 lg:py-8">
       <HeroSection
+        theme={theme}
         connectionState={connectionState}
         lastUpdatedLabel={lastUpdatedLabel}
         onRefresh={async () => {
@@ -327,50 +436,31 @@ export function Dashboard() {
             setStatsError(message);
           }
         }}
+        onToggleTheme={() => setTheme((current) => (current === "light" ? "dark" : "light"))}
       />
 
-      {notice ? (
-        <div
-          className={`fixed right-4 top-4 z-50 rounded-2xl border px-4 py-3 text-sm shadow-panel ${
-            notice.tone === "success"
-              ? "border-emerald-500/30 bg-emerald-500/15 text-emerald-100"
-              : "border-rose-500/30 bg-rose-500/15 text-rose-100"
-          }`}
-        >
-          {notice.message}
-        </div>
-      ) : null}
+      {notice ? <Toast notice={notice} /> : null}
 
-      <section className="grid gap-4 sm:grid-cols-2 xl:grid-cols-5">
+      <section className="grid gap-4 sm:grid-cols-2 xl:grid-cols-4">
         <MetricCard
           label="Total events"
           value={stats.total_events.toLocaleString()}
-          hint="Persisted processed events"
-          accent="primary"
+          hint="Persisted processed events."
         />
         <MetricCard
           label="Events / sec"
           value={stats.events_per_second.toFixed(2)}
-          hint="Rolling throughput window"
-          accent="secondary"
+          hint="Rolling throughput window."
         />
         <MetricCard
           label="Tracked categories"
           value={String(stats.top_categories.length)}
-          hint="Distinct categories in top set"
-          accent="neutral"
+          hint="Categories in the top set."
         />
         <MetricCard
-          label="Live stream"
-          value={connectionState.toUpperCase()}
-          hint="SSE connection status"
-          accent={connectionState === "live" ? "success" : "danger"}
-        />
-        <MetricCard
-          label="Last updated"
-          value={lastUpdatedLabel}
-          hint="Frontend session timestamp"
-          accent="neutral"
+          label="Queue depth"
+          value={stats.queue_depth.toLocaleString()}
+          hint="Events waiting to be processed."
         />
       </section>
 
@@ -378,12 +468,12 @@ export function Dashboard() {
         <InlineFeedback
           tone="error"
           message={statsError}
-          helper="The dashboard will keep retrying the live stream while you can still use the control plane."
+          helper="The dashboard will keep retrying the live stream while the control plane remains available."
         />
       ) : null}
 
-      <section className="grid gap-6 xl:grid-cols-[1.1fr_0.9fr]">
-        <article className="panel rounded-2xl p-5 shadow-panel sm:p-6">
+      <section className="grid gap-5 xl:grid-cols-[1.1fr_0.9fr]">
+        <article className="flat-panel p-5 sm:p-6">
           <SectionTitle
             eyebrow="Manual Ingestion"
             title="Submit a single event"
@@ -431,7 +521,7 @@ export function Dashboard() {
                 value={eventPayload}
                 onChange={(inputEvent) => setEventPayload(inputEvent.target.value)}
                 rows={9}
-                className={`${inputClassName} min-h-48 resize-y font-mono text-sm`}
+                className={`${inputClassName} min-h-48 resize-y text-sm`}
               />
             </Field>
 
@@ -443,22 +533,18 @@ export function Dashboard() {
               />
             ) : null}
 
-            <div className="flex flex-col gap-3 border-t border-forge-border pt-4 sm:flex-row sm:items-center sm:justify-between">
-              <p className="text-sm text-forge-muted">
+            <div className="flex flex-col gap-3 border-t border-[var(--border)] pt-4 sm:flex-row sm:items-center sm:justify-between">
+              <p className="text-sm text-[var(--ink-muted)]">
                 POSTs a batch of one event to <code>/events</code>.
               </p>
-              <button
-                type="submit"
-                disabled={isSubmittingEvent}
-                className="inline-flex items-center justify-center rounded-xl bg-forge-primary px-4 py-2.5 text-sm font-semibold text-white transition hover:bg-blue-500 disabled:cursor-not-allowed disabled:opacity-60"
-              >
+              <button type="submit" disabled={isSubmittingEvent} className="primary-button">
                 {isSubmittingEvent ? "Submitting..." : "Submit Event"}
               </button>
             </div>
           </form>
         </article>
 
-        <article className="panel rounded-2xl p-5 shadow-panel sm:p-6">
+        <article className="flat-panel p-5 sm:p-6">
           <SectionTitle
             eyebrow="Demo Generator"
             title="Generate synthetic traffic"
@@ -508,7 +594,7 @@ export function Dashboard() {
                   key={size}
                   type="button"
                   onClick={() => setDemoCount(size)}
-                  className="rounded-xl border border-forge-border bg-forge-elevated px-3 py-2 text-sm text-forge-text transition hover:border-forge-primary hover:text-white"
+                  className="secondary-button"
                 >
                   {size}
                 </button>
@@ -522,20 +608,20 @@ export function Dashboard() {
                 taskIds={batchFeedback.taskIds}
               />
             ) : (
-              <p className="rounded-xl border border-dashed border-forge-border bg-forge-elevated/70 px-4 py-4 text-sm text-forge-muted">
+              <p className="empty-state text-left">
                 Generate a burst of events to drive the worker queue and watch the metrics update over SSE.
               </p>
             )}
 
-            <div className="flex flex-col gap-3 border-t border-forge-border pt-4 sm:flex-row sm:items-center sm:justify-between">
-              <p className="text-sm text-forge-muted">
+            <div className="flex flex-col gap-3 border-t border-[var(--border)] pt-4 sm:flex-row sm:items-center sm:justify-between">
+              <p className="text-sm text-[var(--ink-muted)]">
                 Synthetic events include source, event type, trace ID, partition hint, and region metadata.
               </p>
               <button
                 type="button"
                 disabled={isSubmittingBatch}
                 onClick={handleBatchSubmit}
-                className="inline-flex items-center justify-center rounded-xl bg-forge-secondary px-4 py-2.5 text-sm font-semibold text-slate-950 transition hover:bg-amber-400 disabled:cursor-not-allowed disabled:opacity-60"
+                className="primary-button"
               >
                 {isSubmittingBatch ? "Generating..." : "Generate Demo Batch"}
               </button>
@@ -544,8 +630,28 @@ export function Dashboard() {
         </article>
       </section>
 
-      <section className="grid gap-6 xl:grid-cols-[1.05fr_0.95fr]">
-        <article className="panel rounded-2xl p-5 shadow-panel sm:p-6">
+      <section className="flat-panel p-5 sm:p-6">
+        <div className="flex flex-col gap-4 lg:flex-row lg:items-start lg:justify-between">
+          <SectionTitle
+            eyebrow="Failure & Retry Demo"
+            title="Trigger a bounded retry sequence"
+            description="POST a forced-failure event and show how StreamForge retries with backoff before preserving the failure in the dead-letter table."
+          />
+          <button
+            type="button"
+            disabled={isTriggeringFailure}
+            onClick={handleFailureDemo}
+            className="danger-button"
+          >
+            {isTriggeringFailure ? "Triggering..." : "Trigger a failing event"}
+          </button>
+        </div>
+
+        <LogFeed items={retryLog} emptyMessage="No failing event has been triggered in this session." />
+      </section>
+
+      <section className="grid gap-5 xl:grid-cols-[1.05fr_0.95fr]">
+        <article className="flat-panel p-5 sm:p-6">
           <SectionTitle
             eyebrow="Category Analytics"
             title="Top categories"
@@ -554,35 +660,32 @@ export function Dashboard() {
 
           <div className="mt-6 space-y-4">
             {stats.top_categories.length === 0 ? (
-              <div className="rounded-2xl border border-dashed border-forge-border bg-forge-elevated/70 px-5 py-10 text-center text-sm text-forge-muted">
+              <div className="empty-state">
                 No categories have been processed yet. Submit a manual event or generate a demo batch to populate this view.
               </div>
             ) : (
               stats.top_categories.map((category) => {
                 const ratio = (category.count / Math.max(stats.total_events, 1)) * 100;
                 return (
-                  <div key={category.category} className="rounded-2xl border border-forge-border bg-forge-elevated/75 p-4">
-                    <div className="flex items-center justify-between gap-4">
+                  <div key={category.category} className="category-row">
+                    <div className="grid gap-2 sm:grid-cols-[1fr_auto] sm:items-center">
                       <div>
-                        <p className="text-xs uppercase tracking-[0.3em] text-forge-muted">Category</p>
-                        <p className="mt-1 text-lg font-semibold text-forge-text">{category.category}</p>
+                        <p className="label-text">Category</p>
+                        <p className="mt-1 text-base font-semibold text-[var(--ink)]">{category.category}</p>
                       </div>
-                      <div className="text-right">
-                        <p className="text-xs uppercase tracking-[0.3em] text-forge-muted">Count</p>
-                        <p className="mt-1 text-lg font-semibold text-forge-text">
+                      <div className="sm:text-right">
+                        <p className="label-text">Count</p>
+                        <p className="mt-1 text-base font-semibold text-[var(--ink)]">
                           {category.count.toLocaleString()}
                         </p>
                       </div>
                     </div>
 
-                    <div className="mt-4 h-2.5 overflow-hidden rounded-full bg-slate-800">
-                      <div
-                        className="h-full rounded-full bg-gradient-to-r from-forge-primary via-sky-400 to-forge-secondary transition-all duration-300"
-                        style={{ width: `${Math.max(10, ratio)}%` }}
-                      />
+                    <div className="mt-4 h-3 overflow-hidden border border-[var(--border)] bg-[var(--surface-muted)]">
+                      <div className="h-full bg-[var(--accent)]" style={{ width: `${Math.max(4, ratio)}%` }} />
                     </div>
 
-                    <p className="mt-3 text-sm text-forge-muted">
+                    <p className="mt-3 text-sm text-[var(--ink-muted)]">
                       {ratio.toFixed(1)}% of the currently tracked processed event volume.
                     </p>
                   </div>
@@ -592,83 +695,88 @@ export function Dashboard() {
           </div>
         </article>
 
-        <article className="panel rounded-2xl p-5 shadow-panel sm:p-6">
+        <article className="flat-panel p-5 sm:p-6">
           <SectionTitle
-            eyebrow="Pipeline View"
-            title="How StreamForge moves events"
-            description="A recruiter-friendly view of the distributed path from ingestion to live observability."
+            eyebrow="Processing Time"
+            title="Latency percentiles"
+            description="Durations are calculated from the last 100 processed events using processed_at minus occurred_at."
           />
 
-          <div className="mt-6 grid gap-3">
-            {PIPELINE_STEPS.map((step) => (
-              <div
-                key={step.title}
-                className="rounded-2xl border border-forge-border bg-forge-elevated/80 p-4"
-              >
-                <div className="flex items-start gap-4">
-                  <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-xl bg-forge-primary/20 text-sm font-semibold text-blue-200">
-                    {step.index}
-                  </div>
-                  <div>
-                    <h3 className="text-base font-semibold text-forge-text">{step.title}</h3>
-                    <p className="mt-1 text-sm leading-6 text-forge-muted">{step.description}</p>
-                  </div>
-                </div>
-              </div>
-            ))}
+          <div className="mt-6 overflow-x-auto">
+            <table className="metric-table">
+              <thead>
+                <tr>
+                  <th>Percentile</th>
+                  <th>Seconds</th>
+                  <th>What it shows</th>
+                </tr>
+              </thead>
+              <tbody>
+                <LatencyRow label="p50" value={stats.latency.p50} description="Typical processing time" />
+                <LatencyRow label="p95" value={stats.latency.p95} description="Slow end of normal traffic" />
+                <LatencyRow label="p99" value={stats.latency.p99} description="Tail latency outliers" />
+              </tbody>
+            </table>
           </div>
         </article>
       </section>
 
-      <section className="panel rounded-2xl p-5 shadow-panel sm:p-6">
+      <section className="flat-panel p-5 sm:p-6">
+        <SectionTitle
+          eyebrow="Pipeline View"
+          title="How StreamForge moves events"
+          description="A recruiter-friendly view of the distributed path from ingestion to live observability."
+        />
+
+        <div className="mt-6 grid gap-3 md:grid-cols-2 xl:grid-cols-5">
+          {PIPELINE_STEPS.map((step) => (
+            <div key={step.title} className="pipeline-step">
+              <div className="step-index">{step.index}</div>
+              <h3 className="mt-4 text-base font-semibold text-[var(--ink)]">{step.title}</h3>
+              <p className="mt-2 text-sm leading-6 text-[var(--ink-muted)]">{step.description}</p>
+            </div>
+          ))}
+        </div>
+      </section>
+
+      <section className="flat-panel p-5 sm:p-6">
         <SectionTitle
           eyebrow="Session Activity"
           title="Recent control plane requests"
-          description="This history is stored in the current browser session so you can demonstrate successful submissions and returned task IDs without using terminal commands."
+          description="This history is stored in the current browser session so you can demonstrate successful submissions and returned task IDs without terminal commands."
         />
 
         <div className="mt-6 space-y-3">
           {activity.length === 0 ? (
-            <div className="rounded-2xl border border-dashed border-forge-border bg-forge-elevated/70 px-5 py-10 text-center text-sm text-forge-muted">
+            <div className="empty-state">
               No requests yet in this session. Submit an event or generate a demo batch to populate this activity feed.
             </div>
           ) : (
             activity.map((item) => (
-              <article
-                key={item.id}
-                className="rounded-2xl border border-forge-border bg-forge-elevated/75 p-4"
-              >
+              <article key={item.id} className="activity-item">
                 <div className="flex flex-col gap-3 lg:flex-row lg:items-start lg:justify-between">
                   <div className="space-y-2">
                     <div className="flex flex-wrap items-center gap-2">
-                      <span
-                        className={`rounded-full px-2.5 py-1 text-xs font-medium ${
-                          item.status === "success"
-                            ? "bg-emerald-500/15 text-emerald-200"
-                            : "bg-rose-500/15 text-rose-200"
-                        }`}
-                      >
+                      <StatusPill tone={item.status === "success" ? "success" : "danger"}>
                         {item.status}
-                      </span>
-                      <span className="rounded-full bg-slate-800 px-2.5 py-1 text-xs text-forge-muted">
+                      </StatusPill>
+                      <span className="small-pill">
                         {item.mode === "single" ? "single event" : "demo batch"}
                       </span>
-                      <span className="text-xs uppercase tracking-[0.28em] text-forge-muted">
-                        {formatTime(item.timestamp)}
-                      </span>
+                      <span className="label-text">{formatTime(item.timestamp)}</span>
                     </div>
-                    <h3 className="text-base font-semibold text-forge-text">
-                      {item.category} · {item.eventType} · {item.source}
+                    <h3 className="text-base font-semibold text-[var(--ink)]">
+                      {item.category} / {item.eventType} / {item.source}
                     </h3>
-                    <p className="text-sm text-forge-muted">{item.message}</p>
+                    <p className="text-sm text-[var(--ink-muted)]">{item.message}</p>
                   </div>
 
-                  <div className="grid gap-2 text-sm text-forge-muted sm:grid-cols-2 lg:min-w-80">
-                    <div className="rounded-xl border border-forge-border bg-slate-900/60 px-3 py-2">
-                      Accepted: <span className="font-semibold text-forge-text">{item.accepted}</span>
+                  <div className="grid gap-2 text-sm text-[var(--ink-muted)] sm:grid-cols-2 lg:min-w-80">
+                    <div className="mini-stat">
+                      Accepted: <span className="font-semibold text-[var(--ink)]">{item.accepted}</span>
                     </div>
-                    <div className="rounded-xl border border-forge-border bg-slate-900/60 px-3 py-2">
-                      Task IDs: <span className="font-semibold text-forge-text">{item.taskIds.length}</span>
+                    <div className="mini-stat">
+                      Task IDs: <span className="font-semibold text-[var(--ink)]">{item.taskIds.length}</span>
                     </div>
                   </div>
                 </div>
@@ -676,17 +784,12 @@ export function Dashboard() {
                 {item.taskIds.length > 0 ? (
                   <div className="mt-3 flex flex-wrap gap-2">
                     {item.taskIds.slice(0, 6).map((taskId) => (
-                      <code
-                        key={taskId}
-                        className="rounded-lg border border-forge-border bg-slate-950 px-2.5 py-1 text-xs text-blue-200"
-                      >
+                      <code key={taskId} className="code-chip">
                         {taskId}
                       </code>
                     ))}
                     {item.taskIds.length > 6 ? (
-                      <span className="rounded-lg border border-forge-border bg-slate-900 px-2.5 py-1 text-xs text-forge-muted">
-                        +{item.taskIds.length - 6} more
-                      </span>
+                      <span className="small-pill">+{item.taskIds.length - 6} more</span>
                     ) : null}
                   </div>
                 ) : null}
@@ -700,81 +803,61 @@ export function Dashboard() {
 }
 
 function HeroSection({
+  theme,
   connectionState,
   lastUpdatedLabel,
   onRefresh,
+  onToggleTheme,
 }: {
+  theme: Theme;
   connectionState: ConnectionState;
   lastUpdatedLabel: string;
   onRefresh: () => void | Promise<void>;
+  onToggleTheme: () => void;
 }) {
   return (
-    <section className="panel relative overflow-hidden rounded-3xl p-6 shadow-panel sm:p-8">
-      <div className="pointer-events-none absolute inset-0 bg-[radial-gradient(circle_at_top_left,rgba(59,130,246,0.16),transparent_28%),radial-gradient(circle_at_top_right,rgba(245,158,11,0.08),transparent_22%)]" />
-
-      <div className="relative flex flex-col gap-6 xl:flex-row xl:items-end xl:justify-between">
+    <header className="flat-panel p-5 sm:p-6">
+      <div className="flex flex-col gap-6 lg:flex-row lg:items-start lg:justify-between">
         <div className="max-w-3xl space-y-4">
-          <p className="text-xs uppercase tracking-[0.45em] text-forge-muted">StreamForge</p>
-          <h1 className="heading-font text-4xl font-semibold tracking-tight text-forge-text sm:text-5xl">
+          <p className="label-text">StreamForge</p>
+          <h1 className="text-3xl font-semibold tracking-normal text-[var(--ink)] sm:text-5xl">
             Real-time event processing control plane
           </h1>
-          <p className="max-w-2xl text-base leading-7 text-forge-muted">
+          <p className="max-w-2xl text-base leading-7 text-[var(--ink-muted)]">
             Ingest event batches, simulate traffic, and observe live processing analytics across the
-            FastAPI, Redis, Celery, PostgreSQL, and SSE pipeline from one polished dashboard.
+            FastAPI, Redis, Celery, PostgreSQL, and SSE pipeline from one dashboard.
           </p>
-          <div className="flex flex-wrap gap-3 text-sm">
+          <div className="flex flex-wrap gap-2 text-sm">
             <StatusBadge connectionState={connectionState} />
-            <span className="rounded-full border border-forge-border bg-forge-elevated px-3 py-2 text-forge-muted">
-              Last updated: <span className="text-forge-text">{lastUpdatedLabel}</span>
-            </span>
+            <span className="small-pill">Last updated: {lastUpdatedLabel}</span>
           </div>
         </div>
 
-        <div className="panel-elevated flex flex-col gap-3 rounded-2xl p-4 sm:min-w-80">
-          <p className="text-xs uppercase tracking-[0.35em] text-forge-muted">Control Surface</p>
-          <p className="text-sm leading-6 text-forge-muted">
-            Submit one-off events, generate demo bursts, and keep the live stats stream visible during demos.
-          </p>
+        <div className="flex flex-wrap gap-2 lg:justify-end">
+          <button type="button" onClick={onRefresh} className="secondary-button">
+            Refresh Stats
+          </button>
           <button
             type="button"
-            onClick={onRefresh}
-            className="inline-flex items-center justify-center rounded-xl border border-forge-border bg-slate-900 px-4 py-2.5 text-sm font-medium text-forge-text transition hover:border-forge-primary hover:text-white"
+            onClick={onToggleTheme}
+            aria-pressed={theme === "dark"}
+            className="theme-toggle"
           >
-            Refresh Stats
+            {theme === "dark" ? <SunIcon /> : <MoonIcon />}
+            <span>{theme === "dark" ? "Light mode" : "Dark mode"}</span>
           </button>
         </div>
       </div>
-    </section>
+    </header>
   );
 }
 
-function MetricCard({
-  label,
-  value,
-  hint,
-  accent,
-}: {
-  label: string;
-  value: string;
-  hint: string;
-  accent: "primary" | "secondary" | "neutral" | "success" | "danger";
-}) {
-  const accentClass =
-    accent === "primary"
-      ? "border-blue-500/20 bg-blue-500/10"
-      : accent === "secondary"
-        ? "border-amber-500/20 bg-amber-500/10"
-        : accent === "success"
-          ? "border-emerald-500/20 bg-emerald-500/10"
-          : accent === "danger"
-            ? "border-rose-500/20 bg-rose-500/10"
-            : "border-forge-border bg-forge-panel";
-
+function MetricCard({ label, value, hint }: { label: string; value: string; hint: string }) {
   return (
-    <article className={`rounded-2xl border p-4 shadow-panel ${accentClass}`}>
-      <p className="text-xs uppercase tracking-[0.3em] text-forge-muted">{label}</p>
-      <p className="mt-4 text-2xl font-semibold text-forge-text">{value}</p>
-      <p className="mt-2 text-sm text-forge-muted">{hint}</p>
+    <article className="flat-panel p-4">
+      <p className="label-text">{label}</p>
+      <p className="mt-4 break-words text-2xl font-semibold text-[var(--ink)]">{value}</p>
+      <p className="mt-2 text-sm text-[var(--ink-muted)]">{hint}</p>
     </article>
   );
 }
@@ -790,9 +873,9 @@ function SectionTitle({
 }) {
   return (
     <div>
-      <p className="text-xs uppercase tracking-[0.35em] text-forge-muted">{eyebrow}</p>
-      <h2 className="mt-2 text-2xl font-semibold text-forge-text">{title}</h2>
-      <p className="mt-2 max-w-2xl text-sm leading-6 text-forge-muted">{description}</p>
+      <p className="label-text">{eyebrow}</p>
+      <h2 className="mt-2 text-xl font-semibold text-[var(--ink)] sm:text-2xl">{title}</h2>
+      <p className="mt-2 max-w-3xl text-sm leading-6 text-[var(--ink-muted)]">{description}</p>
     </div>
   );
 }
@@ -810,12 +893,12 @@ function Field({
 }) {
   return (
     <label className="block">
-      <div className="mb-2 flex items-center gap-2 text-sm font-medium text-forge-text">
+      <div className="mb-2 flex items-center gap-2 text-sm font-medium text-[var(--ink)]">
         <span>{label}</span>
-        {required ? <span className="text-forge-secondary">*</span> : null}
+        {required ? <span className="text-[var(--warning)]">*</span> : null}
       </div>
       {children}
-      {helper ? <p className="mt-2 text-xs leading-5 text-forge-muted">{helper}</p> : null}
+      {helper ? <p className="mt-2 text-xs leading-5 text-[var(--ink-muted)]">{helper}</p> : null}
     </label>
   );
 }
@@ -832,19 +915,13 @@ function InlineFeedback({
   taskIds?: string[];
 }) {
   return (
-    <div
-      className={`rounded-2xl border px-4 py-3 text-sm ${
-        tone === "success"
-          ? "border-emerald-500/30 bg-emerald-500/10 text-emerald-100"
-          : "border-rose-500/30 bg-rose-500/10 text-rose-100"
-      }`}
-    >
+    <div className={`feedback ${tone === "success" ? "feedback-success" : "feedback-error"}`}>
       <p>{message}</p>
-      {helper ? <p className="mt-1 text-xs text-current/80">{helper}</p> : null}
+      {helper ? <p className="mt-1 text-xs">{helper}</p> : null}
       {taskIds && taskIds.length > 0 ? (
         <div className="mt-3 flex flex-wrap gap-2">
           {taskIds.slice(0, 5).map((taskId) => (
-            <code key={taskId} className="rounded-lg bg-black/20 px-2 py-1 text-xs">
+            <code key={taskId} className="code-chip">
               {taskId}
             </code>
           ))}
@@ -856,24 +933,12 @@ function InlineFeedback({
 }
 
 function StatusBadge({ connectionState }: { connectionState: ConnectionState }) {
-  const badgeClass =
-    connectionState === "live"
-      ? "border-emerald-500/25 bg-emerald-500/15 text-emerald-200"
-      : connectionState === "connecting"
-        ? "border-amber-500/25 bg-amber-500/15 text-amber-200"
-        : "border-rose-500/25 bg-rose-500/15 text-rose-200";
+  const tone =
+    connectionState === "live" ? "success" : connectionState === "connecting" ? "warning" : "danger";
 
   return (
-    <span className={`inline-flex items-center gap-2 rounded-full border px-3 py-2 text-sm ${badgeClass}`}>
-      <span
-        className={`h-2.5 w-2.5 rounded-full ${
-          connectionState === "live"
-            ? "bg-forge-success"
-            : connectionState === "connecting"
-              ? "bg-forge-secondary"
-              : "bg-forge-danger"
-        }`}
-      />
+    <span className={`status-badge status-${tone}`}>
+      <span className="status-dot" />
       {connectionState === "live"
         ? "Live pipeline connected"
         : connectionState === "connecting"
@@ -883,6 +948,94 @@ function StatusBadge({ connectionState }: { connectionState: ConnectionState }) 
   );
 }
 
+function StatusPill({
+  tone,
+  children,
+}: {
+  tone: "success" | "warning" | "danger" | "neutral";
+  children: ReactNode;
+}) {
+  return <span className={`status-pill status-${tone}`}>{children}</span>;
+}
+
+function LogFeed({ items, emptyMessage }: { items: RetryLogItem[]; emptyMessage: string }) {
+  return (
+    <div className="mt-6 space-y-2">
+      {items.length === 0 ? (
+        <div className="empty-state text-left">{emptyMessage}</div>
+      ) : (
+        items.map((item) => (
+          <div key={item.id} className={`log-line log-${item.tone}`}>
+            <span>{formatClock(item.timestamp)}</span>
+            <span>{item.message}</span>
+          </div>
+        ))
+      )}
+    </div>
+  );
+}
+
+function LatencyRow({
+  label,
+  value,
+  description,
+}: {
+  label: "p50" | "p95" | "p99";
+  value: number;
+  description: string;
+}) {
+  return (
+    <tr>
+      <td>{label}</td>
+      <td>{value.toFixed(4)}</td>
+      <td>{description}</td>
+    </tr>
+  );
+}
+
+function Toast({ notice }: { notice: Exclude<Notice, null> }) {
+  return (
+    <div
+      className={`fixed right-4 top-4 z-50 max-w-[calc(100vw-2rem)] rounded-[6px] border bg-[var(--surface)] px-4 py-3 text-sm ${
+        notice.tone === "success"
+          ? "border-[var(--success)] text-[var(--success)]"
+          : "border-[var(--danger)] text-[var(--danger)]"
+      }`}
+      role="status"
+    >
+      {notice.message}
+    </div>
+  );
+}
+
+function SunIcon() {
+  return (
+    <svg aria-hidden="true" viewBox="0 0 24 24" className="h-4 w-4" fill="none" stroke="currentColor" strokeWidth="2">
+      <circle cx="12" cy="12" r="4" />
+      <path d="M12 2v2M12 20v2M4.93 4.93l1.41 1.41M17.66 17.66l1.41 1.41M2 12h2M20 12h2M4.93 19.07l1.41-1.41M17.66 6.34l1.41-1.41" />
+    </svg>
+  );
+}
+
+function MoonIcon() {
+  return (
+    <svg aria-hidden="true" viewBox="0 0 24 24" className="h-4 w-4" fill="none" stroke="currentColor" strokeWidth="2">
+      <path d="M12.5 2.5a8.5 8.5 0 1 0 9 9.93 6.5 6.5 0 0 1-9-9.93Z" />
+    </svg>
+  );
+}
+
+function normalizeStats(payload: StatsPayload): StatsPayload {
+  return {
+    ...emptyStats,
+    ...payload,
+    latency: {
+      ...emptyStats.latency,
+      ...(payload.latency ?? {}),
+    },
+  };
+}
+
 function formatTime(value: string) {
   return new Intl.DateTimeFormat(undefined, {
     hour: "2-digit",
@@ -890,6 +1043,15 @@ function formatTime(value: string) {
     second: "2-digit",
     month: "short",
     day: "numeric",
+  }).format(new Date(value));
+}
+
+function formatClock(value: string) {
+  return new Intl.DateTimeFormat(undefined, {
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+    hour12: false,
   }).format(new Date(value));
 }
 
@@ -942,4 +1104,4 @@ const PIPELINE_STEPS = [
 ] as const;
 
 const inputClassName =
-  "w-full rounded-xl border border-forge-border bg-forge-elevated px-3 py-2.5 text-forge-text outline-none transition placeholder:text-forge-muted/70 focus:border-forge-primary focus:ring-2 focus:ring-blue-500/20";
+  "w-full rounded-[6px] border border-[var(--border)] bg-[var(--surface)] px-3 py-2.5 text-[var(--ink)] outline-none transition placeholder:text-[var(--ink-muted)] focus-visible:border-[var(--accent)] focus-visible:ring-2 focus-visible:ring-[var(--accent)] disabled:cursor-not-allowed disabled:opacity-60";

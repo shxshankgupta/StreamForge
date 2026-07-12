@@ -10,7 +10,7 @@ from app.core.logging import get_logger
 from app.db.base import SessionLocal, get_db
 from app.schemas.event import EventBatchIngestRequest, EventBatchIngestResponse
 from app.schemas.stats import StatsResponse
-from app.services.analytics import get_stats_payload
+from app.services.analytics import get_stats_payload, publish_stats_update
 from app.services.events import enqueue_events
 from app.services.redis_client import get_pubsub
 
@@ -32,9 +32,11 @@ def healthcheck() -> dict[str, str]:
 def ingest_events(
     payload: EventBatchIngestRequest,
     request: Request,
+    db: Session = Depends(get_db),
 ) -> EventBatchIngestResponse:
     task_ids = enqueue_events(payload.events)
     logger.info("events_enqueued", extra={"count": len(task_ids)})
+    publish_stats_update(db)
     return EventBatchIngestResponse(
         accepted=len(task_ids),
         task_ids=task_ids,

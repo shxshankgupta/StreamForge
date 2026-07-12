@@ -215,6 +215,16 @@ Each event in `POST /events` supports:
 
 To simulate a failure, send `{"force_fail": true}` inside an event payload.
 
+## Design decisions
+
+Redis is used for both the Celery queue and the stats pub/sub channel because StreamForge already depends on it as the fast in-memory coordination layer between the API, workers, and dashboard. Keeping queueing and live metric fanout in one operational dependency reduces setup complexity while still matching the needs of this project: durable enough task handoff through Celery and low-latency notifications for observability.
+
+Retries are bounded with backoff so transient failures get another chance without letting a bad event consume worker capacity forever. The delay between attempts gives downstream systems time to recover, and the hard retry limit keeps the pipeline predictable under repeated failures.
+
+Failed events are persisted to `dead_letter_events` instead of being dropped silently because failures are data the operator needs to inspect. A dead-letter table preserves the payload and error context for debugging, replay decisions, and proof that the system handled the failure deliberately.
+
+Queue depth measures how many events are waiting in Redis before workers process them, which makes backlog pressure visible during bursts. The latency percentiles measure `processed_at - occurred_at` across the latest processed events; p50 shows the typical path, while p95 and p99 reveal slower tail behavior that averages can hide.
+
 ## Testing
 
 ### Unit and integration tests

@@ -7,6 +7,12 @@ export type StatsPayload = {
   total_events: number;
   events_per_second: number;
   top_categories: CategoryStat[];
+  queue_depth: number;
+  latency: {
+    p50: number;
+    p95: number;
+    p99: number;
+  };
 };
 
 export type EventBatchResponse = {
